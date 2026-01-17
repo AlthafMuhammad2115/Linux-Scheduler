@@ -1,7 +1,7 @@
 from ssh_client import SSH
 from env import Env
 from agent import Agent
-import random, time, csv
+import random, time, csv, threading
 from datetime import datetime
 
 # ===================== BASIC LOGGER =====================
@@ -56,27 +56,44 @@ if USE_RL:
         log(f"Episode {ep+1}/30 started")
 
         for step in range(10):
-            load = random.choice([ 200])
+            load = random.choice([15,30, 60, 90])
             log(f"Step {step+1} | Workload = {load}")
 
-            env.run_workload(load)
-            time.sleep(1)
+            # 1. Observe initial system state (before workload)
+            # PIDs are empty because we haven't started it yet
+            s = env.get_state([], load)
 
-            pids = ssh.run("pgrep -f hackbench").split()
-            log(f"EVAL PIDs: {pids}")
-            s = env.get_state(pids, load)
-
+            # 2. Agent chooses action (Priority)
             a = agent.act(s)
-            env.apply_action(pids, a)
+            
+            # 3. Apply Action: Run workload with chosen nice value
+            # This logic is now encapsulated in env.apply_action
+            pids_str = env.apply_action(load, a)
+            
+            # Filter output: keep only digits
+            try:
+                pids = [p for p in pids_str.split() if p.isdigit()]
+            except Exception as e:
+                log(f"Error parsing PIDs: {e}")
+                pids = []
+            
+            log(f"EVAL PIDs: {pids}")
 
+            # 4. Wait for effect
             time.sleep(2)
 
+            # 5. Observe resulting state
             ns = env.get_state(pids, load)
+            
+            # 6. Compute Reward
             r = compute_reward(s, ns, a)
+            log(f"Reward = {r:.3f}")
 
-            log(f"Action = {a} | Reward = {r:.3f}")
-
+            # 7. Train
             agent.train(s, a, r, ns)
+            
+            # Cleanup
+            # ssh.run("pkill hackbench")
 
         agent.eps *= 0.95
         log(f"Episode {ep+1} completed | New epsilon = {agent.eps:.3f}")
@@ -88,10 +105,26 @@ if USE_RL:
 def evaluate(fname, use_rl):
     log(f"=== EVALUATION STARTED: {fname} ===")
 
-    # 🔥 START WORKLOAD FOR EVALUATION
-    load = random.choice([10, 50, 100, 200])
-    env.run_workload(load)
-    log(f"EVAL | Started hackbench with load {load}")
+    load = random.choice([15,30, 60, 90])
+    
+    # Proactive Scheduling Evaluation
+    if use_rl:
+        # Get initial state
+        s = env.get_state([], load)
+        a = agent.act(s)
+        # Launch with RL decision
+        pids_str = env.apply_action(load, a)
+        log(f"EVAL | Started hackbench with RL Action {a}")
+    else:
+        # Launch with default (Normal Priority)
+        pids_str = env.run_workload(load, init_nice=0)
+        log(f"EVAL | Started hackbench with default priority")
+
+    try:
+        pids = [p for p in pids_str.split() if p.isdigit()]
+    except:
+        pids = []
+
     time.sleep(2)   # allow processes to spawn
 
     start = time.time()
@@ -102,21 +135,22 @@ def evaluate(fname, use_rl):
 
         while time.time() - start < 300:
 
-            pids = ssh.run("pgrep hackbench").split()
-            log(f"EVAL | PIDs: {pids}")
+            if not pids:
+                # Refresh PIDs if list is empty (maybe check pgrep again)
+                pids_str = ssh.run("pgrep hackbench").strip()
+                pids = [p for p in pids_str.split() if p.isdigit()]
 
             if not pids:
                 log("EVAL | WARNING: No hackbench processes found")
                 time.sleep(1)
-                continue
-
+                # If process finished, maybe break or restart? 
+                # For eval consistency, if it finished early, just break
+                break # Workload finished
+            
+            # Get state
             s = env.get_state(pids, load)
 
-            if use_rl:
-                a = agent.act(s)
-                env.apply_action(pids, a)
-                log(f"EVAL | action={a}")
-
+            log(f"EVAL | cpu_grp={s[0]:.1f}")
             w.writerow([time.time(), s[0], s[1], s[5]])
             time.sleep(1)
 
@@ -136,3 +170,4 @@ else:
 
 log("=== EXPERIMENT COMPLETE ===")
 log("Run: python plot.py")
+ plot.py")

@@ -1,4 +1,5 @@
 import numpy as np
+import random
 import time
 from datetime import datetime
 
@@ -54,7 +55,7 @@ class Env:
         interactivity = 1 if cpu_group < 50 and runqueue < 2 else 0
 
         state = np.array([
-            cpu_group, cpu_total, mem_group, mem_free, 0.0,
+            cpu_group, cpu_total, mem_group, mem_free, ctx_rate,
             runqueue, ctx_rate, avg_nice, max_starve,
             latency, interactivity, workload
         ], dtype=np.float32)
@@ -65,19 +66,22 @@ class Env:
 
         return state
 
-    def apply_action(self, pids, action):
-        if not pids:
-            log("ACTION | no PIDs to adjust")
-            return
+    def apply_action(self, load, action):
+        # Map action to nice value
+        # 0 -> High Priority (-5)
+        # 1 -> Normal Priority (0)
+        # 2 -> Low Priority (5)
+        nice_map = {0: -5, 1: 0, 2: 5}
+        nice_val = nice_map.get(action, 0)
+        
+        log(f"ACTION | Launching with Nice {nice_val} (Action {action})")
+        return self.run_workload(load, init_nice=nice_val)
 
-        for pid in pids:
-            if action == 0:
-                self.ssh.run(f"sudo renice -n -1 -p {pid}")
-            elif action == 2:
-                self.ssh.run(f"sudo renice -n +1 -p {pid}")
-
-        log(f"ACTION | renice action {action} applied to PIDs {pids}")
-
-    def run_workload(self, load):
-        self.ssh.run(f"/usr/bin/hackbench {load} &")
-        log(f"WORKLD | hackbench started with load {load}")
+    def run_workload(self, load, init_nice=0):
+        # Randomize message passing loops between 100 and 5000 as requested
+        loops = random.randint(500, 1000)
+        # Run in background with specified nice value (priority)
+        # Using nice -n ensures the process starts with this priority
+        cmd = f"nice -n {init_nice} hackbench -l {loops} {load} > /dev/null 2>&1 & pgrep -f hackbench"
+        log(f"WORKLD | hackbench started (bg) with load {load}, loops {loops}, nice {init_nice}")
+        return self.ssh.run(cmd).strip()

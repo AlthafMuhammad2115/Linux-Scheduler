@@ -8,4 +8,8 @@ class SSH:
 
     def run(self, cmd):
         stdin, stdout, stderr = self.ssh.exec_command(cmd)
-        return stdout.read().decode()
+        out = stdout.read().decode().strip()
+        err = stderr.read().decode().strip()
+        if err:
+            print(f"[SSH-ERR] Cmd: {cmd}\nError: {err}")
+        return out
