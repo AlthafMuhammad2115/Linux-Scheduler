@@ -6,6 +6,9 @@ B = pd.read_csv("results/without_rl.csv")
 A["throughput"] = A["cpu_group"]
 B["throughput"] = B["cpu_group"]
 
+A["time"] = A["time"] - A["time"].iloc[0]
+B["time"] = B["time"] - B["time"].iloc[0]
+
 A["responsiveness"] = 1/(A["runqueue"]+1)
 B["responsiveness"] = 1/(B["runqueue"]+1)
 

@@ -39,7 +39,7 @@ class Env:
             mem_group += float(mem)
             nice_vals.append(int(ni))
 
-            if 'R' not in stat:
+            if 'R' not in stat: 
                 max_starve = max(max_starve, float(et))
 
         mem_free = float(self.ssh.run("free -m | awk 'NR==2{print $4}'"))

@@ -1,7 +1,7 @@
 from ssh_client import SSH
 from env import Env
 from agent import Agent
-import random, time, csv, threading
+import random, time, csv
 from datetime import datetime
 
 # ===================== BASIC LOGGER =====================
@@ -103,29 +103,8 @@ if USE_RL:
 # ===================== EVALUATION =====================
 
 def evaluate(fname, use_rl):
+
     log(f"=== EVALUATION STARTED: {fname} ===")
-
-    load = random.choice([15,30, 60, 90])
-    
-    # Proactive Scheduling Evaluation
-    if use_rl:
-        # Get initial state
-        s = env.get_state([], load)
-        a = agent.act(s)
-        # Launch with RL decision
-        pids_str = env.apply_action(load, a)
-        log(f"EVAL | Started hackbench with RL Action {a}")
-    else:
-        # Launch with default (Normal Priority)
-        pids_str = env.run_workload(load, init_nice=0)
-        log(f"EVAL | Started hackbench with default priority")
-
-    try:
-        pids = [p for p in pids_str.split() if p.isdigit()]
-    except:
-        pids = []
-
-    time.sleep(2)   # allow processes to spawn
 
     start = time.time()
 
@@ -135,21 +114,34 @@ def evaluate(fname, use_rl):
 
         while time.time() - start < 300:
 
-            if not pids:
-                # Refresh PIDs if list is empty (maybe check pgrep again)
-                pids_str = ssh.run("pgrep hackbench").strip()
-                pids = [p for p in pids_str.split() if p.isdigit()]
+            # 1. Get state
+            load = random.choice([15, 30, 60, 90])
+            s = env.get_state([], load)
 
-            if not pids:
-                log("EVAL | WARNING: No hackbench processes found")
-                time.sleep(1)
-                # If process finished, maybe break or restart? 
-                # For eval consistency, if it finished early, just break
-                break # Workload finished
+            if use_rl:
+                # 2. Act
+                a = agent.act(s)
+                # 3. Apply Action
+                pids_str = env.apply_action(load, a)
             
-            # Get state
+                # Filter output: keep only digits
+                try:
+                    pids = [p for p in pids_str.split() if p.isdigit()]
+                except Exception as e:
+                    log(f"Error parsing PIDs: {e}")
+                    pids = []
+            
+                log(f"EVAL PIDs: {pids}")
+            else:
+                pids_str = env.run_workload(load)
+                try:
+                    pids = [p for p in pids_str.split() if p.isdigit()]
+                except Exception as e:
+                    log(f"Error parsing PIDs: {e}")
+                    pids = []
+                log(f"EVAL PIDs: {pids}")
+            
             s = env.get_state(pids, load)
-
             log(f"EVAL | cpu_grp={s[0]:.1f}")
             w.writerow([time.time(), s[0], s[1], s[5]])
             time.sleep(1)
@@ -164,10 +156,8 @@ def evaluate(fname, use_rl):
 
 if USE_RL:
     evaluate("results/with_rl.csv", True)
-    evaluate("results/without_rl.csv", False)
 else:
     evaluate("results/without_rl.csv", False)
 
 log("=== EXPERIMENT COMPLETE ===")
 log("Run: python plot.py")
- plot.py")
