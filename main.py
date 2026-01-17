@@ -56,43 +56,69 @@ if USE_RL:
         log(f"Episode {ep+1}/30 started")
 
         for step in range(10):
-            load = random.choice([15,30, 60, 90])
+            load = random.choice([1])
             log(f"Step {step+1} | Workload = {load}")
 
-            # 1. Observe initial system state (before workload)
-            # PIDs are empty because we haven't started it yet
-            s = env.get_state([], load)
+            # Clear previous PIDs before starting new workload
+            env.workload_pids = []
 
-            # 2. Agent chooses action (Priority)
-            a = agent.act(s)
+            # Run workload in a separate thread so we don't block
+            t_workload = threading.Thread(target=env.run_workload, args=(load,))
+            t_workload.start()
             
-            # 3. Apply Action: Run workload with chosen nice value
-            # This logic is now encapsulated in env.apply_action
-            pids_str = env.apply_action(load, a)
+            # Give it a moment to spawn and populate PIDs
+            time.sleep(1)
+
+            # Wait for PIDs to be available
+            for _ in range(5):
+                if env.workload_pids:
+                    break
+                time.sleep(1)
             
-            # Filter output: keep only digits
-            try:
-                pids = [p for p in pids_str.split() if p.isdigit()]
-            except Exception as e:
-                log(f"Error parsing PIDs: {e}")
-                pids = []
-            
+            pids = env.workload_pids
             log(f"EVAL PIDs: {pids}")
 
-            # 4. Wait for effect
+ 
+
+          
+            # Start hackbench if not already running, then try to get PIDs
+            # for attempt in range(5):
+            #     if attempt == 0: # Only run hackbench on the first attempt
+            #         ssh.run("hackbench -l 5000 10 &")
+            #         time.sleep(0.5) # Give hackbench a moment to start
+                
+            #     pids_str = ssh.run("pgrep -f hackbench").strip()
+            #     if pids_str:
+            #         # Filter out non-numeric output (hackbench sometimes leaks stdout)
+            #         pids = [p for p in pids_str.split() if p.isdigit()]
+            #         if pids:
+            #             break
+            #     log(f"Waiting for hackbench... (Attempt {attempt+1}/5)")
+            #     time.sleep(1)
+            
+            # if not pids:
+            #     log("WARNING: Could not find hackbench PIDs. Is it installed?")
+            #     continue
+
+          
+            s = env.get_state(pids, load)
+
+            a = agent.act(s)
+            
+            env.apply_action(pids, a)
             time.sleep(2)
 
-            # 5. Observe resulting state
             ns = env.get_state(pids, load)
-            
-            # 6. Compute Reward
             r = compute_reward(s, ns, a)
-            log(f"Reward = {r:.3f}")
 
-            # 7. Train
+            log(f"Action = {a} | Reward = {r:.3f}")
+
             agent.train(s, a, r, ns)
             
-            # Cleanup
+            # Enable this if you want to ensure the workload finishes before next step
+            t_workload.join()
+            
+            # Cleanup step to prevent fork bomb
             # ssh.run("pkill hackbench")
 
         agent.eps *= 0.95
@@ -105,26 +131,10 @@ if USE_RL:
 def evaluate(fname, use_rl):
     log(f"=== EVALUATION STARTED: {fname} ===")
 
-    load = random.choice([15,30, 60, 90])
-    
-    # Proactive Scheduling Evaluation
-    if use_rl:
-        # Get initial state
-        s = env.get_state([], load)
-        a = agent.act(s)
-        # Launch with RL decision
-        pids_str = env.apply_action(load, a)
-        log(f"EVAL | Started hackbench with RL Action {a}")
-    else:
-        # Launch with default (Normal Priority)
-        pids_str = env.run_workload(load, init_nice=0)
-        log(f"EVAL | Started hackbench with default priority")
-
-    try:
-        pids = [p for p in pids_str.split() if p.isdigit()]
-    except:
-        pids = []
-
+    # 🔥 START WORKLOAD FOR EVALUATION
+    load = random.choice([15, 30, 60, 90])  
+    env.run_workload(load)
+    log(f"EVAL | Started hackbench with load {load}")
     time.sleep(2)   # allow processes to spawn
 
     start = time.time()
@@ -135,22 +145,23 @@ def evaluate(fname, use_rl):
 
         while time.time() - start < 300:
 
-            if not pids:
-                # Refresh PIDs if list is empty (maybe check pgrep again)
-                pids_str = ssh.run("pgrep hackbench").strip()
-                pids = [p for p in pids_str.split() if p.isdigit()]
+            pids_str = ssh.run("pgrep hackbench").strip()
+            # Filter out non-numeric output
+            pids = [p for p in pids_str.split() if p.isdigit()]
+            log(f"EVAL | PIDs: {pids}")
 
             if not pids:
                 log("EVAL | WARNING: No hackbench processes found")
                 time.sleep(1)
-                # If process finished, maybe break or restart? 
-                # For eval consistency, if it finished early, just break
-                break # Workload finished
-            
-            # Get state
+                continue
+
             s = env.get_state(pids, load)
 
-            log(f"EVAL | cpu_grp={s[0]:.1f}")
+            if use_rl:
+                a = agent.act(s)
+                env.apply_action(pids, a)
+                log(f"EVAL | action={a}")
+
             w.writerow([time.time(), s[0], s[1], s[5]])
             time.sleep(1)
 
@@ -164,10 +175,8 @@ def evaluate(fname, use_rl):
 
 if USE_RL:
     evaluate("results/with_rl.csv", True)
-    evaluate("results/without_rl.csv", False)
 else:
     evaluate("results/without_rl.csv", False)
 
 log("=== EXPERIMENT COMPLETE ===")
 log("Run: python plot.py")
- plot.py")

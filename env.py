@@ -16,6 +16,7 @@ class Env:
         self.ssh = ssh
         self.prev_ctxt = int(self.ssh.run("grep ctxt /proc/stat").split()[1])
         self.prev_time = time.time()
+        self.workload_pids = []  # Added shared variable
         log("Environment initialized")
 
     def get_state(self, pids, workload):
@@ -66,22 +67,37 @@ class Env:
 
         return state
 
-    def apply_action(self, load, action):
-        # Map action to nice value
-        # 0 -> High Priority (-5)
-        # 1 -> Normal Priority (0)
-        # 2 -> Low Priority (5)
-        nice_map = {0: -5, 1: 0, 2: 5}
-        nice_val = nice_map.get(action, 0)
-        
-        log(f"ACTION | Launching with Nice {nice_val} (Action {action})")
-        return self.run_workload(load, init_nice=nice_val)
+    def apply_action(self, pids, action):
+        if not pids:
+            log("ACTION | no PIDs to adjust")
+            return
 
-    def run_workload(self, load, init_nice=0):
+        for pid in pids:
+            try:
+                # Get current nice value
+                current_ni = int(self.ssh.run(f"ps -p {pid} -o ni --no-headers").strip())
+                
+                new_ni = 0
+                if action == 0:   # Boost priority (lower nice value)
+                    new_ni = max(-20, current_ni - 1)
+                elif action == 2: # Lower priority (higher nice value)
+                    new_ni = min(19, current_ni + 1)
+                
+                if new_ni != current_ni:
+                    self.ssh.run(f"sudo renice -n {new_ni} -p {pid}")
+            except Exception as e:
+                log(f"ACTION | Error setting nice for PID {pid}: {e}")
+
+        log(f"ACTION | Adjust action {action} applied to PIDs {pids}")
+
+    def run_workload(self, load):
         # Randomize message passing loops between 100 and 5000 as requested
-        loops = random.randint(500, 1000)
-        # Run in background with specified nice value (priority)
-        # Using nice -n ensures the process starts with this priority
-        cmd = f"nice -n {init_nice} hackbench -l {loops} {load} > /dev/null 2>&1 & pgrep -f hackbench"
-        log(f"WORKLD | hackbench started (bg) with load {load}, loops {loops}, nice {init_nice}")
-        return self.ssh.run(cmd).strip()
+        loops = random.randint(100, 500)
+        # Removed /usr/bin/ prefix to rely on PATH
+        pids_str = self.ssh.run(f"hackbench -l {loops} {load} > /dev/null 2>&1 & pgrep -f hackbench").strip()
+        
+        # Parse and store PIDs in the shared variable
+        self.workload_pids = [p for p in pids_str.split() if p.isdigit()]
+        
+        # log(f"WORKLD | hackbench started with load {load}, loops {loops}, PIDs: {self.workload_pids}")
+        return self.workload_pids
