@@ -112,3 +112,17 @@ class Agent:
             target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
 
         # log(f"Network updated | Loss = {loss.item():.5f}")
+
+    def save(self, filepath="rl_model.pth"):
+        torch.save(self.policy_net.state_dict(), filepath)
+        log(f"Model saved to {filepath}")
+
+    def load(self, filepath="rl_model.pth"):
+        import os
+        if os.path.exists(filepath):
+            self.policy_net.load_state_dict(torch.load(filepath, weights_only=True))
+            self.target_net.load_state_dict(self.policy_net.state_dict())
+            self.policy_net.eval()
+            log(f"Model loaded from {filepath}")
+        else:
+            log(f"WARNING: No saved model found at {filepath}!")

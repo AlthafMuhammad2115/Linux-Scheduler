@@ -12,11 +12,12 @@ def log(msg):
 
 # ===================== CONFIG =====================
 
-VM_IP = "192.168.122.98"
+VM_IP = "192.168.122.155"
 USER  = "oltha"
 PASS  = "Drowssap0011#"
 
-USE_RL = True   # <----- TOGGLE THIS
+USE_RL = False   # <----- TOGGLE THIS
+TRAIN_MODE = False  # <----- Set to True to train, False to just load and evaluate
 
 # ===================== SETUP =====================
 
@@ -49,7 +50,7 @@ def compute_reward(s, ns, action):
 
 # ===================== TRAINING =====================
 
-if USE_RL:
+if USE_RL and TRAIN_MODE:
     log("=== TRAINING STARTED ===")
 
     for ep in range(30):
@@ -99,12 +100,17 @@ if USE_RL:
         log(f"Episode {ep+1} completed | New epsilon = {agent.eps:.3f}")
 
     log("=== TRAINING FINISHED ===")
+    agent.save("rl_model.pth")
 
 # ===================== EVALUATION =====================
 
 def evaluate(fname, use_rl):
 
     log(f"=== EVALUATION STARTED: {fname} ===")
+
+    if use_rl:
+        agent.load("rl_model.pth")
+        agent.eps = 0.0
 
     start = time.time()
 
