@@ -18,7 +18,7 @@ class DQN(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(12, 64),
+            nn.Linear(6, 64),
             nn.ReLU(),
             nn.Linear(64, 64),
             nn.ReLU(),
@@ -62,7 +62,7 @@ class Agent:
         
         log("Agent initialized with Replay Buffer & Target Net")
 
-    def act(self, state):
+    def     act(self, state):
         # log(f"Epsilon = {self.eps:.3f}")
 
         if random.random() < self.eps:
@@ -82,7 +82,7 @@ class Agent:
         self.memory.push(s, a, r, ns)
         
         if len(self.memory) < self.batch_size:
-            return
+            return 0.0
 
         # Sample batch
         states, actions, rewards, next_states = self.memory.sample(self.batch_size)
@@ -111,7 +111,7 @@ class Agent:
         for param, target_param in zip(self.policy_net.parameters(), self.target_net.parameters()):
             target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
 
-        # log(f"Network updated | Loss = {loss.item():.5f}")
+        return loss.item()
 
     def save(self, filepath="rl_model.pth"):
         torch.save(self.policy_net.state_dict(), filepath)
@@ -123,6 +123,7 @@ class Agent:
             self.policy_net.load_state_dict(torch.load(filepath, weights_only=True))
             self.target_net.load_state_dict(self.policy_net.state_dict())
             self.policy_net.eval()
+            self.target_net.eval()  # Ensure target net is also in eval mode
             log(f"Model loaded from {filepath}")
         else:
             log(f"WARNING: No saved model found at {filepath}!")
