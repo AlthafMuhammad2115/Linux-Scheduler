@@ -15,14 +15,14 @@ def log(msg):
 # ========== DQN NETWORK ==========
 
 class DQN(nn.Module):
-    def __init__(self):
+    def __init__(self, state_dim, action_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(6, 64),
+            nn.Linear(state_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 64),
             nn.ReLU(),
-            nn.Linear(64, 3)
+            nn.Linear(64, action_dim)
         )
 
     def forward(self, x):
@@ -48,9 +48,9 @@ class ReplayBuffer:
 # ========== AGENT ==========
 
 class Agent:
-    def __init__(self):
-        self.policy_net = DQN()
-        self.target_net = DQN()
+    def __init__(self, state_dim=4, action_dim=2):
+        self.policy_net = DQN(state_dim, action_dim)
+        self.target_net = DQN(state_dim, action_dim)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
         
@@ -59,32 +59,26 @@ class Agent:
         self.batch_size = 32
         self.gamma = 0.95
         self.eps = 1.0
+        self.action_dim = action_dim
         
-        log("Agent initialized with Replay Buffer & Target Net")
+        log(f"Agent initialized with Replay Buffer & Target Net (state_dim={state_dim}, action_dim={action_dim})")
 
-    def     act(self, state):
-        # log(f"Epsilon = {self.eps:.3f}")
-
+    def act(self, state):
         if random.random() < self.eps:
-            action = random.randint(0, 2)
-            # log(f"Exploration → Random action {action}")
+            action = random.randint(0, self.action_dim - 1)
         else:
             state_t = torch.tensor(state, dtype=torch.float32)
             with torch.no_grad():
                 qvals = self.policy_net(state_t).numpy()
             action = int(qvals.argmax())
-            # log(f"Exploitation → Best action {action} | Qs: {qvals}")
-
         return action
 
     def train(self, s, a, r, ns):
-        # Store transition
         self.memory.push(s, a, r, ns)
         
         if len(self.memory) < self.batch_size:
             return 0.0
 
-        # Sample batch
         states, actions, rewards, next_states = self.memory.sample(self.batch_size)
 
         states_t = torch.tensor(np.array(states), dtype=torch.float32)
@@ -92,10 +86,8 @@ class Agent:
         rewards_t = torch.tensor(rewards, dtype=torch.float32)
         next_states_t = torch.tensor(np.array(next_states), dtype=torch.float32)
 
-        # Compute Q(s, a)
         q_values = self.policy_net(states_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
 
-        # Compute target Q using Target Network
         with torch.no_grad():
             next_q_values = self.target_net(next_states_t).max(1)[0]
             expected_q_values = rewards_t + self.gamma * next_q_values
@@ -106,7 +98,6 @@ class Agent:
         loss.backward()
         self.opt.step()
 
-        # Soft update target network
         tau = 0.01
         for param, target_param in zip(self.policy_net.parameters(), self.target_net.parameters()):
             target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
@@ -123,7 +114,7 @@ class Agent:
             self.policy_net.load_state_dict(torch.load(filepath, weights_only=True))
             self.target_net.load_state_dict(self.policy_net.state_dict())
             self.policy_net.eval()
-            self.target_net.eval()  # Ensure target net is also in eval mode
+            self.target_net.eval()
             log(f"Model loaded from {filepath}")
         else:
             log(f"WARNING: No saved model found at {filepath}!")

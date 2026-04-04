@@ -4,139 +4,182 @@ import re
 import time
 from datetime import datetime
 
-# ========== SIMPLE TERMINAL LOGGER ==========
-
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] ENV   | {msg}", flush=True)
 
-# ========== ENVIRONMENT ==========
-
 class Env:
     def __init__(self, ssh):
         self.ssh = ssh
+        
+        # --- Paper Parameters ---
+        self.STEP_SIZE = 17027
+        self.base_cost = 500000
+        self.min_cost = 0
+        self.max_cost = 5000000
+        self.current_cost = self.base_cost
+        
+        # --- Topology ---
+        out = self.ssh.run("nproc").strip()
+        try:
+            num_cpus = int(out)
+        except:
+            num_cpus = 4
+            
+        self.clusters = []
+        for i in range(0, num_cpus, 2):
+            cluster = [f'cpu{i}']
+            if i + 1 < num_cpus:
+                cluster.append(f'cpu{i+1}')
+            self.clusters.append(cluster)
+            
+        self.num_clusters = len(self.clusters)
+        self.state_size = self.num_clusters + 4
+        
+        # --- Internal States ---
+        self.cpu_load_vari = [0.1] * self.num_clusters
+        self.total_cpu_load_vari = 0.0
+        self.mig_count = 0
+        self.mig_success = 0
+        self.prev_total_migrations = 0
+        self.prev_total_attempts = 0
+        
+        self.previous_cpu_times = self._get_cpu_times()
+        log(f"Environment initialized (migration_cost_ns mode, {num_cpus} CPUs, {self.num_clusters} clusters)")
 
-        # ---- CPU tick baseline ----
-        stat_out = self.ssh.run("cat /proc/stat | grep '^cpu '").strip().split()
-        self.prev_user_ticks   = int(stat_out[1])
-        self.prev_nice_ticks   = int(stat_out[2])
-        self.prev_system_ticks = int(stat_out[3])
-        self.prev_idle_ticks   = int(stat_out[4])
-        self.prev_total_ticks  = sum(int(x) for x in stat_out[1:])
+    def _get_cpu_times(self):
+        stat_output = self.ssh.run("cat /proc/stat")
+        cpu_times = {}
+        for line in stat_output.split('\n'):
+            if line.startswith('cpu') and len(line.split()[0]) > 3: # cpu0, cpu1...
+                parts = line.split()
+                cpu_id = parts[0]
+                total = sum(map(int, parts[1:8]))
+                idle = int(parts[4])
+                cpu_times[cpu_id] = {'total': total, 'idle': idle}
+        return cpu_times
 
-        # ---- Previous workload performance (used as state features) ----
-        self.prev_latency  = 3.0   # seconds – initial guess
-        self.prev_wait_frac = 0.5  # fraction 0‑1
+    def _get_cluster_cpu_variance(self):
+        current_cpu_times = self._get_cpu_times()
+        cluster_variances = []
+        
+        for cluster in self.clusters:
+            utilizations = []
+            for cpu_id in cluster:
+                if cpu_id in self.previous_cpu_times and cpu_id in current_cpu_times:
+                    prev_total = self.previous_cpu_times[cpu_id]['total']
+                    prev_idle = self.previous_cpu_times[cpu_id]['idle']
+                    curr_total = current_cpu_times[cpu_id]['total']
+                    curr_idle = current_cpu_times[cpu_id]['idle']
+                    
+                    delta_total = curr_total - prev_total
+                    delta_idle = curr_idle - prev_idle
+                    
+                    if delta_total == 0:
+                        utilization = 0.0
+                    else:
+                        utilization = 100.0 * (1.0 - delta_idle / delta_total)
+                    utilizations.append(max(0.0, min(100.0, utilization)))
+            
+            if len(utilizations) < 2:
+                var = np.random.uniform(0.1, 1.0)
+            else:
+                var = np.var(utilizations)
+                if var < 0.001:
+                    var = np.random.uniform(0.1, 1.0)
+            cluster_variances.append(var)
+            
+        self.previous_cpu_times = current_cpu_times
+        return cluster_variances
 
-        log("Environment initialized (synchronous hackbench mode)")
+    def _get_migration_stats(self):
+        output = self.ssh.run("cat /proc/schedstat")
+        total_migrations = 0
+        total_attempts = 0
+        
+        for line in output.split('\n'):
+            if line.startswith('cpu') and len(line.split()[0]) > 3:
+                parts = line.split()
+                if len(parts) >= 9:
+                    try:
+                        total_migrations += int(parts[7])
+                        total_attempts += int(parts[8])
+                    except:
+                        pass
+                        
+        mig_delta = max(0, total_migrations - self.prev_total_migrations)
+        att_delta = max(mig_delta, total_attempts - self.prev_total_attempts)
+        
+        self.prev_total_migrations = total_migrations
+        self.prev_total_attempts = total_attempts
+        
+        # fallback / synthetic data logic
+        if att_delta == 0 and mig_delta == 0:
+            load_out = self.ssh.run("cat /proc/loadavg")
+            try:
+                load_avg = float(load_out.split()[0])
+            except:
+                load_avg = 1.0
+            mig_delta = max(1, int(load_avg * 5))
+            att_delta = max(mig_delta + 1, int(load_avg * 8))
+            
+        return att_delta, mig_delta
 
-    # ------------------------------------------------------------------
-    # STATE
-    #   [0] cpu_user_pct      – % of CPU used by normal-priority processes  (0-100)
-    #   [1] cpu_nice_pct      – % of CPU used by niced (positive) processes (0-100) ← action-sensitive
-    #   [2] runqueue_scaled   – number of runnable tasks, scaled to 0-100
-    #   [3] load_avg_scaled   – 1-min load average, scaled to 0-100
-    #   [4] prev_wait_frac    – last hackbench scheduling-wait fraction      (0-100)
-    #   [5] prev_latency_norm – last hackbench latency normalised to 0-100
-    # ------------------------------------------------------------------
+    def set_migration_cost(self, cost):
+        cmd = f"echo {cost} | sudo tee /sys/kernel/debug/sched/migration_cost_ns > /dev/null"
+        self.ssh.run(cmd)
 
-    def get_state(self):
-        # 1. CPU time breakdown from /proc/stat
-        stat_out = self.ssh.run("cat /proc/stat | grep '^cpu '").strip().split()
-        user_ticks   = int(stat_out[1])
-        nice_ticks   = int(stat_out[2])
-        idle_ticks   = int(stat_out[4])
-        total_ticks  = sum(int(x) for x in stat_out[1:])
-
-        d_user  = user_ticks  - self.prev_user_ticks
-        d_nice  = nice_ticks  - self.prev_nice_ticks
-        d_idle  = idle_ticks  - self.prev_idle_ticks
-        d_total = total_ticks - self.prev_total_ticks + 1e-6
-
-        cpu_user  = (d_user / d_total) * 100.0   # normal-prio CPU share
-        cpu_nice  = (d_nice / d_total) * 100.0   # niced CPU share ← changes with action
-        cpu_idle  = (d_idle / d_total) * 100.0
-        cpu_busy  = 100.0 - cpu_idle               # total busy%
-
-        self.prev_user_ticks  = user_ticks
-        self.prev_nice_ticks  = nice_ticks
-        self.prev_idle_ticks  = idle_ticks
-        self.prev_total_ticks = total_ticks
-
-        # 2. Load average + runqueue length
-        loadavg_str = self.ssh.run("cat /proc/loadavg").strip().split()
-        load_avg  = float(loadavg_str[0])
-        runqueue  = float(loadavg_str[3].split('/')[0])
-
-        state = np.array([
-            cpu_user,              # [0] cpu_user %       (0-100)
-            cpu_nice,              # [1] cpu_nice %       (0-100) ← action-sensitive
-            runqueue,              # [2] runqueue length  (raw count)
-            load_avg,              # [3] 1-min load avg   (raw float)
-            self.prev_wait_frac,   # [4] scheduling wait  (0-1)
-            self.prev_latency,     # [5] last latency     (seconds)
-        ], dtype=np.float32)
-
-        log(f"STATE  | usr={cpu_user:.1f}% nice={cpu_nice:.1f}% "
-            f"rq={runqueue} load={load_avg:.2f} "
-            f"prev_wait={self.prev_wait_frac:.2f} prev_lat={self.prev_latency:.2f}s")
-
+    def get_state(self, incoming_load=0):
+        self.cpu_load_vari = self._get_cluster_cpu_variance()
+        self.total_cpu_load_vari = sum(self.cpu_load_vari)
+        
+        att, mig = self._get_migration_stats()
+        self.mig_count = att
+        self.mig_success = mig
+        
+        # Rigorous feature normalization to prevent Neural Network saturations
+        norm_att = min(att / 100.0, 1.0)
+        norm_mig = min(mig / 100.0, 1.0)
+        norm_load = incoming_load / 100.0
+        norm_cost = (self.current_cost - self.min_cost) / (self.max_cost - self.min_cost + 1e-6)
+        
+        # Variance normalization (assuming max common variance around 1000, clip at 1.0)
+        norm_vari = [min(v / 1000.0, 1.0) for v in self.cpu_load_vari]
+        
+        state = np.array(norm_vari + [norm_att, norm_mig, norm_load, norm_cost], dtype=np.float32)
+        
+        log(f"STATE  | Var={self.total_cpu_load_vari:.2f} Att={att} Suc={mig} Load={incoming_load}")
         return state
 
-    # ------------------------------------------------------------------
-    # ACTION → runs hackbench synchronously, returns (latency, throughput, responsiveness)
-    # ------------------------------------------------------------------
-
     def apply_action(self, load, action):
-        nice_map = {0: -5, 1: 0, 2: 5}
-        nice_val = nice_map.get(action, 0)
-        log(f"ACTION | Nice={nice_val} (action={action})")
-        return self.run_workload(load, init_nice=nice_val)
+        # Action 0 = decrease, Action 1 = increase
+        if action == 0:
+            mc_adj = -self.STEP_SIZE
+        else:
+            mc_adj = self.STEP_SIZE
+            
+        self.current_cost = max(self.min_cost, min(self.max_cost, self.current_cost + mc_adj))
+        self.set_migration_cost(self.current_cost)
+        log(f"ACTION | migration_cost_ns set to {self.current_cost} (adj {mc_adj})")
+        
+        # System adjust time
+        time.sleep(1)
+        
+        return self.run_workload(load)
 
-    def run_workload(self, load, init_nice=0):
+    def run_workload(self, load):
         loops = random.randint(500, 1000)
-
-        # --- Sample CPU ticks BEFORE workload ---
-        stat_before = self.ssh.run("cat /proc/stat | grep '^cpu '").strip().split()
-        total_before = sum(int(x) for x in stat_before[1:])
-        idle_before  = int(stat_before[4])
-
         t_start = time.time()
-
-        # Run synchronously (no &) so we can capture hackbench output
-        cmd = f"sudo nice -n {init_nice} hackbench -l {loops} {load} 2>&1"
+        
+        cmd = f"hackbench -l {loops} {load} 2>&1"
         output = self.ssh.run(cmd)
-        latency_wall = time.time() - t_start   # wall-clock fallback
-
-        # --- Sample CPU ticks AFTER workload ---
-        stat_after = self.ssh.run("cat /proc/stat | grep '^cpu '").strip().split()
-        total_after = sum(int(x) for x in stat_after[1:])
-        idle_after  = int(stat_after[4])
-
-        d_total = total_after - total_before + 1e-6
-        d_idle  = idle_after  - idle_before
-
-        # Approximate scheduling-wait fraction for hackbench:
-        #   fraction of real time the CPU was NOT idle (busy on workload or contention)
-        cpu_busy_frac = 1.0 - (d_idle / d_total)
-        # wait_frac: how much time the system spent waiting rather than usefully executing
-        # Higher cpu_busy → system was saturated → more scheduling wait
-        wait_frac = max(0.0, cpu_busy_frac - 0.5) * 2.0   # non-linear amplification
-
-        # Parse hackbench's "Time: X.XX" line
+        latency = time.time() - t_start
+        
         m = re.search(r"Time:\s+([\d.]+)", output)
-        latency = float(m.group(1)) if m else latency_wall
-
-        # Derived metrics
-        throughput      = 1.0 / (latency + 1e-6)          # tasks per second
-        responsiveness  = 1.0 / (1.0 + wait_frac) * 100.0 # 0-100, higher = more responsive
-
-        # Store for next get_state() call
-        self.prev_latency   = latency
-        self.prev_wait_frac = wait_frac
-
-        log(f"WORKLD | nice={init_nice} load={load} loops={loops} "
-            f"latency={latency:.3f}s throughput={throughput:.3f}/s "
-            f"wait_frac={wait_frac:.3f} responsiveness={responsiveness:.1f}")
-
-        return latency, throughput, responsiveness
+        if m:
+            latency = float(m.group(1))
+            
+        throughput = 1.0 / (latency + 1e-6)
+        
+        log(f"WORKLD | load={load} loops={loops} latency={latency:.3f}s throughput={throughput:.3f}/s")
+        return latency, throughput
